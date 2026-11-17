@@ -1,5 +1,7 @@
 import os
+import re
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -16,7 +18,10 @@ COLLECTION_NAME = os.getenv("PG_VECTOR_COLLECTION_NAME")
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
-BATCH_SIZE = 100
+# Lotes pequenos evitam estourar o limite de tokens/minuto dos planos gratuitos
+BATCH_SIZE = int(os.getenv("INGEST_BATCH_SIZE", "20"))
+MAX_RETRIES = 6
+DEFAULT_RETRY_SECONDS = 30
 
 
 def get_provider() -> str:
@@ -99,6 +104,31 @@ def load_and_split() -> list[Document]:
     ]
 
 
+def is_rate_limit_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return "429" in text or "quota" in text or "rate limit" in text or "resourceexhausted" in text
+
+
+def retry_delay_seconds(error: Exception) -> float:
+    """Usa o tempo sugerido pela API ("retry in 29.7s"), se houver."""
+    match = re.search(r"retry in ([\d.]+)\s*s", str(error), re.IGNORECASE)
+    return float(match.group(1)) + 1 if match else DEFAULT_RETRY_SECONDS
+
+
+def add_batch_with_retry(store: PGVector, docs: list[Document], ids: list[str]) -> None:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            store.add_documents(documents=docs, ids=ids)
+            return
+        except Exception as e:
+            if not is_rate_limit_error(e) or attempt == MAX_RETRIES:
+                raise
+            wait = retry_delay_seconds(e)
+            print(f"  Limite de requisições atingido; aguardando {wait:.0f}s "
+                  f"(tentativa {attempt}/{MAX_RETRIES})...")
+            time.sleep(wait)
+
+
 def ingest_pdf():
     try:
         validate_env()
@@ -115,7 +145,7 @@ def ingest_pdf():
     ids = [f"doc-{i}" for i in range(len(chunks))]
     for start in range(0, len(chunks), BATCH_SIZE):
         end = start + BATCH_SIZE
-        store.add_documents(documents=chunks[start:end], ids=ids[start:end])
+        add_batch_with_retry(store, chunks[start:end], ids[start:end])
         print(f"  {min(end, len(chunks))}/{len(chunks)} chunks armazenados")
 
     print(f"Ingestão concluída na collection '{COLLECTION_NAME}'.")
